@@ -16,6 +16,10 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .idea/
+.vscode/
+
+# Zenohd binaries (download from eclipse.org/zenoh)
+tool/zenoh/
 
 # zenoh-pico cmake build artifacts
 CMakeCache.txt
