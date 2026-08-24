@@ -22,7 +22,6 @@ Usage:
 import argparse
 import atexit
 import os
-import signal
 import socket
 import struct
 import subprocess
