@@ -389,7 +389,8 @@ class ProxyServer:
         ext_addr = f"0.0.0.0:{self.ext_port}"
         int_addr = f"127.0.0.1:{self.int_port}"
 
-        # 直接启动内部 zenohd（不通过 ZenohdManager，避免 PID 文件冲突）
+        # 直接启动内部 zenohd（使用独立 PID 文件避免冲突）
+        self._proxy_pid_file = os.path.join(SCRIPT_DIR, f".proxy_zenohd_{self.int_port}.pid")
         try:
             self._zenohd_proc = subprocess.Popen(
                 [ZENOHD_EXE, "-l", f"tcp/127.0.0.1:{self.int_port}"],
@@ -398,10 +399,13 @@ class ProxyServer:
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            time.sleep(1)
+            time.sleep(1.5)
             if self._zenohd_proc.poll() is not None:
                 print(f"[ERROR] 内部 zenohd 启动失败，退出码: {self._zenohd_proc.returncode}")
                 return
+            # 写入唯一 PID 文件
+            with open(self._proxy_pid_file, "w") as f:
+                f.write(str(self._zenohd_proc.pid))
         except Exception as e:
             print(f"[ERROR] 内部 zenohd 启动异常: {e}")
             return
@@ -467,6 +471,9 @@ class ProxyServer:
             if self._zenohd_proc and self._zenohd_proc.poll() is None:
                 self._zenohd_proc.terminate()
                 self._zenohd_proc.wait(timeout=5)
+            # 清理 PID 文件
+            if hasattr(self, '_proxy_pid_file') and os.path.exists(self._proxy_pid_file):
+                os.remove(self._proxy_pid_file)
 
 
 # =============================================================================
