@@ -558,125 +558,112 @@ class ZenohGUI(ctk.CTk):
 
     # ==================== 3. 报文代理 ====================
     def on_proxy_start(self):
-        if self.proxy_process and self.proxy_process.poll() is None:
+        if getattr(self, "proxy_thread", None) and self.proxy_thread.is_alive():
             messagebox.showwarning("提示", "代理已在运行")
             return
 
-        # 确保没有旧的 zenohd 进程冲突
+        # 清理旧的 zenohd 进程和 PID 文件（避免端口冲突）
         self.log_info("清理旧 zenohd 进程...")
         subprocess.run(["taskkill", "/F", "/IM", "zenohd.exe"],
                        capture_output=True)
-        # 清理 PID 文件
         for f in [".zenohd.pid", ".proxy_zenohd.pid"]:
             fp = os.path.join(SCRIPT_DIR, f)
             if os.path.exists(fp):
                 os.remove(fp)
 
-        # 启动代理子进程
-        ext_port = self.proxy_port_entry.get().strip() or "7447"
-        int_port = str(int(ext_port) + 1)
+        # 代理端口配置
+        ext_port = int(self.proxy_port_entry.get().strip() or "7447")
+        int_port = ext_port + 1
 
-        proxy_script = os.path.join(SCRIPT_DIR, "host_zenoh_test.py")
-        cmd = [
-            sys.executable, proxy_script, "proxy",
-            "--port", ext_port,
-            "--int-port", int_port,
-        ]
-        if self.hex_only_var.get():
-            cmd.append("--hex-only")
-        if self.full_hex_var.get():
-            cmd.append("--full-hex")
-
+        # 导入 ProxyServer（从 host_zenoh_test.py）
+        sys.path.insert(0, SCRIPT_DIR)
         try:
-            self.proxy_process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            # 等待代理启动（最多 5 秒）
-            self.log_info(f"正在启动代理 (ESP32 → {ext_port} → zenohd(:{int_port}))...")
-            self._wait_proxy_start(ext_port, int_port, start_time=time.time())
+            from host_zenoh_test import ProxyServer
+        except ImportError as e:
+            messagebox.showerror("错误", f"导入失败: {e}")
+            return
+
+        self.log_system(f"启动代理: ESP32 → 127.0.0.1:{ext_port} → zenohd(:{int_port})...")
+        self.proxy_status.configure(text=f"代理启动中 (端口 {ext_port})...",
+                                    text_color="gray60")
+        self.proxy_hint.configure(text="代理将 ESP32 报文透明转发并显示在右侧日志区")
+
+        # 在线程中运行代理（不回产生子进程）
+        self.proxy_server = ProxyServer(
+            ext_port=ext_port,
+            int_port=int_port,
+            hex_only=self.hex_only_var.get(),
+            full_hex=self.full_hex_var.get(),
+            log_callback=lambda m: self._append_log(m, "packet"),
+        )
+        self.proxy_thread = threading.Thread(
+            target=self._run_proxy, args=(ext_port, int_port), daemon=True)
+        self.proxy_thread.start()
+        self.after(500, lambda: self._check_proxy_started(ext_port))
+
+    def _run_proxy(self, ext_port, int_port):
+        """在线程中运行 ProxyServer，异常捕获后输出"""
+        try:
+            self.proxy_server.run()
         except Exception as e:
-            messagebox.showerror("错误", f"代理启动失败: {e}")
+            import traceback
+            self.after(0, lambda: self.log_error(
+                f"代理异常: {e}\n{traceback.format_exc()}"))
+            self.after(0, lambda: self.proxy_status.configure(
+                text="代理已停止 (异常)", text_color="#d1242f"))
 
-    def _wait_proxy_start(self, ext_port, int_port, start_time):
-        """等待代理进程就绪，最多 5 秒"""
-        elapsed = time.time() - start_time
-        if elapsed > 5:
-            # 超时，检查进程是否已退出
-            if self.proxy_process and self.proxy_process.poll() is not None:
-                err_out = ""
-                try:
-                    err_out = self.proxy_process.stdout.read(500) if self.proxy_process.stdout else ""
-                except Exception:
-                    pass
-                self.log_error(f"代理启动失败 (退出码 {self.proxy_process.returncode}):\n{err_out}")
-                self.proxy_status.configure(text="代理启动失败", text_color="#d1242f")
-                self.proxy_process = None
-            else:
-                # 进程还在运行，但端口可能还没就绪，继续等待
-                self.after(200, lambda: self._wait_proxy_start(ext_port, int_port, start_time))
+    def _check_proxy_started(self, ext_port):
+        """轮询检查代理端口是否就绪"""
+        # 线程可能已退出（异常）
+        if not self.proxy_thread.is_alive():
+            self.proxy_status.configure(text="代理已停止", text_color="#d1242f")
+            self.proxy_thread = None
             return
-
-        # 检查进程是否已退出
-        if self.proxy_process and self.proxy_process.poll() is not None:
-            err_out = ""
-            try:
-                err_out = self.proxy_process.stdout.read(500) if self.proxy_process.stdout else ""
-            except Exception:
-                pass
-            self.log_error(f"代理启动失败 (退出码 {self.proxy_process.returncode}):\n{err_out}")
-            self.proxy_status.configure(text="代理启动失败", text_color="#d1242f")
-            self.proxy_process = None
-            return
-
         # 检查端口是否就绪
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
+            s.settimeout(0.3)
             result = s.connect_ex(("127.0.0.1", int(ext_port)))
             s.close()
             if result == 0:
-                # 代理就绪！
-                self.log_success(f"代理已启动: ESP32 → 127.0.0.1:{ext_port} → zenohd(:{int_port})")
+                self.log_success(f"代理运行中 (端口 {ext_port}) ✓")
                 self.proxy_status.configure(text=f"代理运行中 (端口 {ext_port})",
                                             text_color="#1a7f37")
-                self._read_proxy_output()
                 return
-        except Exception:
+        except OSError:
             pass
-
-        # 还没就绪，继续轮询
-        self.after(200, lambda: self._wait_proxy_start(ext_port, int_port, start_time))
-
-    def _read_proxy_output(self):
-        if self.proxy_process is None:
-            return
-        try:
-            line = self.proxy_process.stdout.readline()
-            if line:
-                self.log_packet(line.rstrip())
-        except Exception:
-            pass
-        if self.proxy_process and self.proxy_process.poll() is None:
-            self.after(50, self._read_proxy_output)
+        # 继续轮询，最多 10 秒
+        if not hasattr(self, "_proxy_retry"):
+            self._proxy_retry = 0
+        self._proxy_retry += 1
+        if self._proxy_retry < 20:
+            self.after(500, lambda: self._check_proxy_started(ext_port))
         else:
-            self.log_info("代理已停止")
-            self.proxy_status.configure(text="代理已停止", text_color="#ff7b72")
-            self.proxy_process = None
+            self._proxy_retry = 0
+            self.log_error("代理端口未就绪，请检查下方日志")
+            self.proxy_status.configure(text="代理启动超时", text_color="#d1242f")
 
     def on_proxy_stop(self):
-        if self.proxy_process and self.proxy_process.poll() is None:
-            self.proxy_process.terminate()
-            self.log_info("正在停止代理...")
-        else:
+        if not getattr(self, "proxy_thread", None) or not self.proxy_thread.is_alive():
             self.log_info("代理未在运行")
+            self.proxy_status.configure(text="代理已停止", text_color="gray60")
+            return
+        self.log_info("正在停止代理...")
+        # 停止代理服务器（由回调在主线程安全触发）
+        try:
+            self.proxy_server.stop()
+        except Exception as e:
+            self.log_error(f"停止代理异常: {e}")
+        self.proxy_status.configure(text="代理已停止", text_color="gray60")
+        self.proxy_thread = None
 
     # ==================== 关闭处理 ====================
     def on_close(self):
-        # 清理子进程
-        if self.proxy_process and self.proxy_process.poll() is None:
-            self.proxy_process.terminate()
+        # 清理代理
+        try:
+            self.on_proxy_stop()
+        except Exception:
+            pass
         self.destroy()
 
 

@@ -282,13 +282,21 @@ class ZenohPacketParser:
 # =============================================================================
 class ProxyServer:
     def __init__(self, ext_port=PROXY_EXT_PORT, int_port=ZENOHD_INT_PORT,
-                 hex_only=False, full_hex=False):
+                 hex_only=False, full_hex=False, log_callback=None):
         self.ext_port = ext_port
         self.int_port = int_port
         self.hex_only = hex_only
         self.full_hex = full_hex
+        self.log_callback = log_callback
         self._running = False
         self._zenohd_proc = None
+
+    def _log(self, msg, *args, **kwargs):
+        """输出日志：有回调用回调，否则 print"""
+        if self.log_callback:
+            self.log_callback(msg)
+        else:
+            print(msg, *args, **kwargs)
 
     def _log_packet(self, direction, data):
         """打印一条报文记录（完整的逐层解析）"""
@@ -304,7 +312,7 @@ class ProxyServer:
         t_name, t_flags = ZenohPacketParser.describe_transport_header(first_byte)
         flag_str = f"[{','.join(t_flags)}]" if t_flags else ""
         direction_tag = "IN" if direction == DIR_ESP2PC else "OUT"
-        print(f"{timestamp} {direction} {t_name} {flag_str}")
+        self._log(f"{timestamp} {direction} {t_name} {flag_str}")
 
         # ---- hex dump ----
         show = data[:hex_limit]
@@ -316,9 +324,9 @@ class ProxyServer:
             prefix = f"  HEX [{len(data)}b]: "
         else:
             prefix = "  HEX: "
-        print(f"{prefix}{hex_str}  |{ascii_str}|")
+        self._log(f"{prefix}{hex_str}  |{ascii_str}|")
         if len(data) > hex_limit:
-            print(f"  ... 剩余 {len(data) - hex_limit} 字节省略")
+            self._log(f"  ... 剩余 {len(data) - hex_limit} 字节省略")
 
         # ---- 深度解析：FRAME → 内部网络报文 ----
         if mid == 0x05:  # T_FRAME
@@ -334,7 +342,7 @@ class ProxyServer:
                 nmsgs = ZenohPacketParser.scan_network_messages(net_payload)
                 if nmsgs:
                     names = "  ├─ 网络层: " + " → ".join(n[1] for n in nmsgs)
-                    print(names)
+                    self._log(names)
 
                     # 尝试进一步解析 N_PUSH 内的 Z_PUT/Z_DEL/Z_QUERY
                     for offset, name in nmsgs:
@@ -347,25 +355,25 @@ class ProxyServer:
                                     break
                             if z_msgs:
                                 z_names = " → ".join(n[1] for n in z_msgs)
-                                print(f"  └─ 会话层: {z_names}")
+                                self._log(f"  └─ 会话层: {z_names}")
 
         # ---- 握手消息额外信息 ----
         if mid == 0x01:  # T_INIT
             if len(data) > 1:
                 # 尝试解析 ZID 长度
                 is_ack = (first_byte >> 5) & 1  # flag A
-                print(f"    类型: {'InitAck' if is_ack else 'InitSyn'}")
+                self._log(f"    类型: {'InitAck' if is_ack else 'InitSyn'}")
         elif mid == 0x02:  # T_OPEN
             is_ack = (first_byte >> 5) & 1
-            print(f"    类型: {'OpenAck' if is_ack else 'OpenSyn'}")
+            self._log(f"    类型: {'OpenAck' if is_ack else 'OpenSyn'}")
         elif mid == 0x03:  # T_CLOSE
             if len(data) > 1:
                 reason = data[1]
-                print(f"    原因码: {reason:#04x}")
+                self._log(f"    原因码: {reason:#04x}")
         elif mid == 0x07:  # T_JOIN
             if len(data) > 1:
                 zid_len = ((data[1] & 0xF0) >> 4) + 1
-                print(f"    ZID 长度: {zid_len} 字节")
+                self._log(f"    ZID 长度: {zid_len} 字节")
 
     def _forward(self, src_name, src_sock, dst_sock, log_cb):
         """双向转发：从 src 读，写入 dst，同时记录日志"""
@@ -381,6 +389,29 @@ class ProxyServer:
         finally:
             try:
                 src_sock.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        """停止代理服务器"""
+        self._running = False
+        # 关闭监听 socket（如果有）
+        if hasattr(self, '_server_sock') and self._server_sock:
+            try:
+                self._server_sock.close()
+            except OSError:
+                pass
+        # 关闭内部 zenohd
+        if self._zenohd_proc and self._zenohd_proc.poll() is None:
+            self._zenohd_proc.terminate()
+            try:
+                self._zenohd_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._zenohd_proc.kill()
+        # 清理 PID 文件
+        if hasattr(self, '_proxy_pid_file') and os.path.exists(self._proxy_pid_file):
+            try:
+                os.remove(self._proxy_pid_file)
             except OSError:
                 pass
 
@@ -401,46 +432,46 @@ class ProxyServer:
             )
             time.sleep(1.5)
             if self._zenohd_proc.poll() is not None:
-                print(f"[ERROR] 内部 zenohd 启动失败，退出码: {self._zenohd_proc.returncode}")
+                self._log(f"[ERROR] 内部 zenohd 启动失败，退出码: {self._zenohd_proc.returncode}")
                 return
             # 写入唯一 PID 文件
             with open(self._proxy_pid_file, "w") as f:
                 f.write(str(self._zenohd_proc.pid))
         except Exception as e:
-            print(f"[ERROR] 内部 zenohd 启动异常: {e}")
+            self._log(f"[ERROR] 内部 zenohd 启动异常: {e}")
             return
 
-        print(f"\n{'=' * 60}")
+        self._log(f"\n{'=' * 60}")
         if self.hex_only:
-            print(f"  Zenoh 报文代理 (HEX ONLY)")
+            self._log(f"  Zenoh 报文代理 (HEX ONLY)")
         elif self.full_hex:
-            print(f"  Zenoh 报文代理 (完整 HEX)")
+            self._log(f"  Zenoh 报文代理 (完整 HEX)")
         else:
-            print(f"  Zenoh 报文代理 + 协议解析")
-        print(f"  ESP32 连接: {ext_addr}  ──►  zenohd: {int_addr}")
-        print(f"  按 Ctrl+C 停止")
-        print(f"{'=' * 60}\n")
+            self._log(f"  Zenoh 报文代理 + 协议解析")
+        self._log(f"  ESP32 连接: {ext_addr}  ──►  zenohd: {int_addr}")
+        self._log(f"  按 Ctrl+C 停止")
+        self._log(f"{'=' * 60}\n")
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", self.ext_port))
-        server.listen(5)
-        server.settimeout(1.0)
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind(("0.0.0.0", self.ext_port))
+        self._server_sock.listen(5)
+        self._server_sock.settimeout(1.0)
         self._running = True
 
         try:
             while self._running:
                 try:
-                    client_sock, addr = server.accept()
+                    client_sock, addr = self._server_sock.accept()
                 except socket.timeout:
                     continue
-                print(f"\n[CONNECT] ESP32 已连接: {addr[0]}:{addr[1]}")
+                self._log(f"\n[CONNECT] ESP32 已连接: {addr[0]}:{addr[1]}")
 
                 try:
                     zenohd_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     zenohd_sock.connect(("127.0.0.1", self.int_port))
                 except ConnectionRefusedError:
-                    print(f"[ERROR] 无法连接内部 zenohd (127.0.0.1:{self.int_port})")
+                    self._log(f"[ERROR] 无法连接内部 zenohd (127.0.0.1:{self.int_port})")
                     client_sock.close()
                     continue
 
@@ -461,13 +492,17 @@ class ProxyServer:
 
                 t1.join()
                 t2.join()
-                print(f"[DISCONNECT] ESP32 已断开 ({addr[0]}:{addr[1]})\n")
+                self._log(f"[DISCONNECT] ESP32 已断开 ({addr[0]}:{addr[1]})\n")
 
         except KeyboardInterrupt:
-            print("\n[PROXY] 代理已停止")
+            self._log("\n[PROXY] 代理已停止")
         finally:
             self._running = False
-            server.close()
+            if hasattr(self, '_server_sock') and self._server_sock:
+                try:
+                    self._server_sock.close()
+                except OSError:
+                    pass
             if self._zenohd_proc and self._zenohd_proc.poll() is None:
                 self._zenohd_proc.terminate()
                 self._zenohd_proc.wait(timeout=5)
