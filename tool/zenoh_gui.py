@@ -23,7 +23,7 @@ from tkinter import ttk, messagebox
 import customtkinter as ctk
 
 # 设置主题
-ctk.set_appearance_mode("dark")
+ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -172,7 +172,7 @@ class ZenohGUI(ctk.CTk):
         # ---- 标题 ----
         title = ctk.CTkLabel(
             self.control_frame, text="Zenoh ESP32 测试工具",
-            font=ctk.CTkFont(size=22, weight="bold")
+            font=ctk.CTkFont(size=20)
         )
         title.grid(row=0, column=0, pady=(16, 4))
 
@@ -280,8 +280,11 @@ class ZenohGUI(ctk.CTk):
         self.proxy_port_entry.insert(0, "7447")
 
         self.hex_only_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(proxy_frame, text="仅 HEX", variable=self.hex_only_var,
+        self.full_hex_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(proxy_frame, text="仅HEX", variable=self.hex_only_var,
                         width=28).grid(row=0, column=2, sticky="e")
+        ctk.CTkCheckBox(proxy_frame, text="完整HEX", variable=self.full_hex_var,
+                        width=28).grid(row=0, column=3, sticky="e", padx=4)
 
         proxy_btns = ctk.CTkFrame(proxy_frame, fg_color="transparent")
         proxy_btns.grid(row=1, column=0, columnspan=3, pady=(8, 0), sticky="ew")
@@ -308,7 +311,7 @@ class ZenohGUI(ctk.CTk):
     def _section_label(self, text):
         return ctk.CTkLabel(
             self.control_frame, text=text,
-            font=ctk.CTkFont(size=14, weight="bold"), text_color="#64b5f6"
+            font=ctk.CTkFont(size=13), text_color="#1565c0"
         )
 
     # ==================== 日志区 ====================
@@ -322,11 +325,11 @@ class ZenohGUI(ctk.CTk):
         ctk.CTkButton(log_header, text="🗑 清空", width=60, command=self.clear_log,
                       fg_color="gray40", hover_color="gray55").grid(row=0, column=1, sticky="e")
 
-        # 使用 Text 控件 + 自定义配色
+        # 使用 Text 控件 + 浅色背景
         self.log_text = tk.Text(
-            self.log_frame, bg="#1e1e1e", fg="#d4d4d4",
+            self.log_frame, bg="#ffffff", fg="#333333",
             font=("Consolas", 10), wrap="word", state="disabled",
-            insertbackground="#d4d4d4", selectbackground="#264f78"
+            insertbackground="#333333", selectbackground="#add6ff"
         )
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 8))
 
@@ -347,12 +350,13 @@ class ZenohGUI(ctk.CTk):
         def _do_append():
             self.log_text.configure(state="normal")
             self.log_text.insert("end", text + "\n", tag)
-            self.log_text.tag_config("info", foreground="#d4d4d4")
-            self.log_text.tag_config("success", foreground="#7ee787")
-            self.log_text.tag_config("error", foreground="#ff7b72")
-            self.log_text.tag_config("system", foreground="#79c0ff")
-            self.log_text.tag_config("packet", foreground="#d2a8ff")
-            self.log_text.tag_config("header", foreground="#ffa657")
+            # 浅色背景下的标签颜色
+            self.log_text.tag_config("info", foreground="#333333")
+            self.log_text.tag_config("success", foreground="#1a7f37")
+            self.log_text.tag_config("error", foreground="#d1242f")
+            self.log_text.tag_config("system", foreground="#0550ae")
+            self.log_text.tag_config("packet", foreground="#8250df")
+            self.log_text.tag_config("header", foreground="#953800")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
 
@@ -559,28 +563,26 @@ class ZenohGUI(ctk.CTk):
             messagebox.showwarning("提示", "代理已在运行")
             return
 
-        # 确保 zenohd 运行
-        if not ZenohdManager.is_running():
-            port = self.port_entry.get().strip() or "7447"
-            proto_raw = self.protocol_var.get()
-            protocols = tuple(proto_raw.split("+"))
-            ok, msg = ZenohdManager.start(port, protocols=protocols)
-            if not ok:
-                messagebox.showerror("错误", f"无法启动 zenohd: {msg}")
-                return
-            self.log_success(f"路由器: {msg}")
+        # 代理需要独立管理 zenohd（内部端口 = 外部端口+1）
+        # 先停止 GUI 启动的 zenohd，避免端口和 PID 文件冲突
+        if ZenohdManager.is_running():
+            self.log_info("正在停止 GUI 的 zenohd，让代理统一管理...")
+            ZenohdManager.stop()
 
         # 启动代理
         ext_port = self.proxy_port_entry.get().strip() or "7447"
-        int_port = str(int(ext_port) + 1)  # 内部端口
+        int_port = str(int(ext_port) + 1)
 
         proxy_script = os.path.join(SCRIPT_DIR, "host_zenoh_test.py")
         cmd = [
             sys.executable, proxy_script, "proxy",
             "--port", ext_port,
+            "--int-port", int_port,
         ]
         if self.hex_only_var.get():
             cmd.append("--hex-only")
+        if self.full_hex_var.get():
+            cmd.append("--full-hex")
 
         try:
             self.proxy_process = subprocess.Popen(
@@ -588,9 +590,18 @@ class ZenohGUI(ctk.CTk):
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            self.log_success(f"代理已启动: ESP32 → 127.0.0.1:{ext_port} → zenohd")
-            self.proxy_status.configure(text=f"代理运行中 (端口 {ext_port}) ✅",
-                                        text_color="#7ee787")
+            # 等一小会儿确认代理启动
+            time.sleep(1)
+            if self.proxy_process.poll() is not None:
+                # 读取错误输出
+                err_out = self.proxy_process.stdout.read(200) if self.proxy_process.stdout else ""
+                messagebox.showerror("错误", f"代理启动失败:\n{err_out}")
+                self.proxy_process = None
+                return
+
+            self.log_success(f"代理已启动: ESP32 → 127.0.0.1:{ext_port} → zenohd(:{int_port})")
+            self.proxy_status.configure(text=f"代理运行中 (端口 {ext_port})",
+                                        text_color="#1a7f37")
             self._read_proxy_output()
         except Exception as e:
             messagebox.showerror("错误", f"代理启动失败: {e}")

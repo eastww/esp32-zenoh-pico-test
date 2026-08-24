@@ -231,9 +231,9 @@ class ZenohPacketParser:
 
     @staticmethod
     def describe_network_header(header_byte):
-        """解析网络层报文头（在 FRAME payload 内）"""
-        mid = header_byte & 0x0F
-        flags = header_byte >> 4
+        """解析网络层报文头（在 FRAME payload 内，mid 占低 5 位）"""
+        mid = header_byte & 0x1F
+        flags = header_byte >> 5
         name = NETWORK_MSG.get(mid, f"N_UNKNOWN({mid:#x})")
         flag_desc = []
         if mid == 0x1d:  # PUSH
@@ -245,24 +245,21 @@ class ZenohPacketParser:
         elif mid == 0x1b:  # RESPONSE
             if flags & 0x04: flag_desc.append("N(NAMED)")
             if flags & 0x02: flag_desc.append("M(MAPPING)")
-        if flags & 0x08: flag_desc.append("Z(EXT)")
+        if flags & 0x01: flag_desc.append("Z(EXT)")
         return name, flag_desc
 
     @staticmethod
     def scan_network_messages(data):
-        """在二进制数据中扫描网络报文类型（启发式：扫描每个字节）"""
+        """在二进制数据中扫描网络报文类型（启发式，mid 占低 5 位）"""
         if not data:
             return []
         found = []
-        # 只扫描前 1024 字节，避免太长
         scan_len = min(len(data), 1024)
         for i in range(scan_len):
             b = data[i]
-            mid = b & 0x0F
+            mid = b & 0x1F  # 网络层 mid 是 5 位
             if mid in NETWORK_MSG:
                 name = NETWORK_MSG[mid]
-                # 高 4 位通常是 0x08 (Z) 或其他标志
-                # 避免误判（连续相同字节时只取第一个）
                 if found and found[-1][1] == name and found[-1][0] == i - 1:
                     continue
                 found.append((i, name))
@@ -286,47 +283,90 @@ class ZenohPacketParser:
 # =============================================================================
 class ProxyServer:
     def __init__(self, ext_port=PROXY_EXT_PORT, int_port=ZENOHD_INT_PORT,
-                 hex_only=False):
+                 hex_only=False, full_hex=False):
         self.ext_port = ext_port
         self.int_port = int_port
         self.hex_only = hex_only
+        self.full_hex = full_hex
         self._running = False
+        self._zenohd_proc = None
 
     def _log_packet(self, direction, data):
-        """打印一条报文记录"""
+        """打印一条报文记录（完整的逐层解析）"""
         timestamp = time.strftime("%H:%M:%S")
-        if self.hex_only:
-            dump = ZenohPacketParser.hex_dump(data, max_bytes=128)
-            print(f"{timestamp} {direction} {dump}")
+        if not data:
             return
 
-        # 解析第一条传输报文头
-        if len(data) >= 1:
-            t_name, t_flags = ZenohPacketParser.describe_transport_header(data[0])
-            flag_str = f"[{','.join(t_flags)}]" if t_flags else ""
-            print(f"{timestamp} {direction} {t_name} {flag_str}")
+        hex_limit = 999999 if self.full_hex else (256 if self.hex_only else 128)
+        first_byte = data[0]
+        mid = first_byte & 0x0F
 
-        # hex dump
-        dump = ZenohPacketParser.hex_dump(data, max_bytes=64)
-        print(f"{' ' * 8}{dump}")
+        # ---- 第一行：传输层报文类型 ----
+        t_name, t_flags = ZenohPacketParser.describe_transport_header(first_byte)
+        flag_str = f"[{','.join(t_flags)}]" if t_flags else ""
+        direction_tag = "IN" if direction == DIR_ESP2PC else "OUT"
+        print(f"{timestamp} {direction} {t_name} {flag_str}")
 
-        # 尝试扫描 FRAME 内的网络报文
-        if len(data) >= 1:
-            mid = data[0] & 0x0F
-            if mid == 0x05:  # FRAME — 跳过 SN(zint) 扫描 payload 中的网络报文
-                # 跳过第一个字节(header)，尝试解析 SN (zint 变长编码)
-                payload = data[1:]
-                # 跳过 zint SN (每个字节高1位是 continuation)
-                sn_len = 0
-                for b in payload:
-                    sn_len += 1
-                    if b < 0x80:
-                        break
-                net_payload = payload[sn_len:]
+        # ---- hex dump ----
+        show = data[:hex_limit]
+        hex_str = " ".join(f"{b:02x}" for b in show)
+        ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in show)
+        if len(data) > hex_limit:
+            prefix = f"  HEX [{len(data)}b, show {hex_limit}]: "
+        elif len(data) > 0:
+            prefix = f"  HEX [{len(data)}b]: "
+        else:
+            prefix = "  HEX: "
+        print(f"{prefix}{hex_str}  |{ascii_str}|")
+        if len(data) > hex_limit:
+            print(f"  ... 剩余 {len(data) - hex_limit} 字节省略")
+
+        # ---- 深度解析：FRAME → 内部网络报文 ----
+        if mid == 0x05:  # T_FRAME
+            payload = data[1:]
+            # 跳过 zint SN
+            sn_len = 0
+            for b in payload:
+                sn_len += 1
+                if b < 0x80:
+                    break
+            net_payload = payload[sn_len:]
+            if net_payload:
                 nmsgs = ZenohPacketParser.scan_network_messages(net_payload)
                 if nmsgs:
-                    names = " -> ".join(n[1] for n in nmsgs)
-                    print(f"{' ' * 8}  └─ 内含: {names}")
+                    names = "  ├─ 网络层: " + " → ".join(n[1] for n in nmsgs)
+                    print(names)
+
+                    # 尝试进一步解析 N_PUSH 内的 Z_PUT/Z_DEL/Z_QUERY
+                    for offset, name in nmsgs:
+                        if name == "N_PUSH" and offset + 1 < len(net_payload):
+                            inner = net_payload[offset + 1:]
+                            z_msgs = []
+                            for j, b in enumerate(inner):
+                                if b in ZENOH_MSG:
+                                    z_msgs.append((j, ZENOH_MSG[b]))
+                                    break
+                            if z_msgs:
+                                z_names = " → ".join(n[1] for n in z_msgs)
+                                print(f"  └─ 会话层: {z_names}")
+
+        # ---- 握手消息额外信息 ----
+        if mid == 0x01:  # T_INIT
+            if len(data) > 1:
+                # 尝试解析 ZID 长度
+                is_ack = (first_byte >> 5) & 1  # flag A
+                print(f"    类型: {'InitAck' if is_ack else 'InitSyn'}")
+        elif mid == 0x02:  # T_OPEN
+            is_ack = (first_byte >> 5) & 1
+            print(f"    类型: {'OpenAck' if is_ack else 'OpenSyn'}")
+        elif mid == 0x03:  # T_CLOSE
+            if len(data) > 1:
+                reason = data[1]
+                print(f"    原因码: {reason:#04x}")
+        elif mid == 0x07:  # T_JOIN
+            if len(data) > 1:
+                zid_len = ((data[1] & 0xF0) >> 4) + 1
+                print(f"    ZID 长度: {zid_len} 字节")
 
     def _forward(self, src_name, src_sock, dst_sock, log_cb):
         """双向转发：从 src 读，写入 dst，同时记录日志"""
@@ -346,16 +386,32 @@ class ProxyServer:
                 pass
 
     def run(self):
-        """启动代理服务器"""
-        # 启动 zenohd（如果未运行）
-        ZenohdManager.start(int_port=self.int_port, protocols=("tcp",))
-
+        """启动代理服务器 + 内部 zenohd"""
         ext_addr = f"0.0.0.0:{self.ext_port}"
         int_addr = f"127.0.0.1:{self.int_port}"
+
+        # 直接启动内部 zenohd（不通过 ZenohdManager，避免 PID 文件冲突）
+        try:
+            self._zenohd_proc = subprocess.Popen(
+                [ZENOHD_EXE, "-l", f"tcp/127.0.0.1:{self.int_port}"],
+                cwd=ZENOHD_DIR,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            time.sleep(1)
+            if self._zenohd_proc.poll() is not None:
+                print(f"[ERROR] 内部 zenohd 启动失败，退出码: {self._zenohd_proc.returncode}")
+                return
+        except Exception as e:
+            print(f"[ERROR] 内部 zenohd 启动异常: {e}")
+            return
 
         print(f"\n{'=' * 60}")
         if self.hex_only:
             print(f"  Zenoh 报文代理 (HEX ONLY)")
+        elif self.full_hex:
+            print(f"  Zenoh 报文代理 (完整 HEX)")
         else:
             print(f"  Zenoh 报文代理 + 协议解析")
         print(f"  ESP32 连接: {ext_addr}  ──►  zenohd: {int_addr}")
@@ -377,16 +433,14 @@ class ProxyServer:
                     continue
                 print(f"\n[CONNECT] ESP32 已连接: {addr[0]}:{addr[1]}")
 
-                # 连接内部 zenohd
                 try:
                     zenohd_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     zenohd_sock.connect(("127.0.0.1", self.int_port))
                 except ConnectionRefusedError:
-                    print(f"[ERROR] 无法连接 zenohd (127.0.0.1:{self.int_port})")
+                    print(f"[ERROR] 无法连接内部 zenohd (127.0.0.1:{self.int_port})")
                     client_sock.close()
                     continue
 
-                # 启动两个方向的转发线程
                 t1 = threading.Thread(
                     target=self._forward,
                     args=("ESP32->PC", client_sock, zenohd_sock,
@@ -402,7 +456,6 @@ class ProxyServer:
                 t1.start()
                 t2.start()
 
-                # 等待断开
                 t1.join()
                 t2.join()
                 print(f"[DISCONNECT] ESP32 已断开 ({addr[0]}:{addr[1]})\n")
@@ -412,7 +465,9 @@ class ProxyServer:
         finally:
             self._running = False
             server.close()
-            ZenohdManager.stop()
+            if self._zenohd_proc and self._zenohd_proc.poll() is None:
+                self._zenohd_proc.terminate()
+                self._zenohd_proc.wait(timeout=5)
 
 
 # =============================================================================
@@ -510,6 +565,10 @@ def main():
     parser.add_argument("--proto", type=str, default="tcp",
                         choices=["tcp", "udp", "tcp+udp"],
                         help="start 命令: zenohd 监听协议 (默认 tcp)")
+    parser.add_argument("--full-hex", action="store_true",
+                        help="proxy 命令: 输出完整 HEX (不截断)")
+    parser.add_argument("--int-port", type=int, default=ZENOHD_INT_PORT,
+                        help="proxy 命令: 内部 zenohd 端口 (默认 7448)")
 
     args = parser.parse_args()
 
@@ -529,10 +588,10 @@ def main():
     elif cmd == "proxy":
         proxy = ProxyServer(
             ext_port=args.port,
+            int_port=args.int_port,
             hex_only=args.hex_only,
+            full_hex=args.full_hex,
         )
-        # 确保停止时清理
-        atexit.register(ZenohdManager.stop)
         proxy.run()
     elif cmd == "sub":
         run_sub(router_endpoint=args.router)
