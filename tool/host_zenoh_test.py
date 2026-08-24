@@ -125,8 +125,10 @@ class ZenohdManager:
             os.remove(PID_FILE)
 
     @staticmethod
-    def start(trace=False, int_port=DEFAULT_ROUTER_PORT):
-        """启动 zenohd。trace=True 前台运行 + 日志输出；False 后台运行。"""
+    def start(trace=False, int_port=DEFAULT_ROUTER_PORT, protocols=("tcp",)):
+        """启动 zenohd。trace=True 前台运行 + 日志输出；False 后台运行。
+        protocols: 协议列表，如 ("tcp",) / ("udp",) / ("tcp", "udp")
+        """
         if ZenohdManager.status():
             print("[START] zenohd 已在运行，跳过")
             return True
@@ -135,14 +137,17 @@ class ZenohdManager:
             print(f"[ERROR] zenohd 未找到: {ZENOHD_EXE}")
             return False
 
-        listen_addr = f"tcp/127.0.0.1:{int_port}"
-        cmd = [ZENOHD_EXE, "-l", listen_addr]
+        # 构建监听参数：每个协议一个 -l 参数
+        cmd = [ZENOHD_EXE]
+        for proto in protocols:
+            cmd += ["-l", f"{proto}/0.0.0.0:{int_port}"]
+        listen_desc = " ".join(f"{p}/0.0.0.0:{int_port}" for p in protocols)
 
         if trace:
             # 前台运行 + RUST_LOG=debug 输出报文日志
             env = os.environ.copy()
             env["RUST_LOG"] = "debug"
-            print(f"[START] 启动 zenohd (trace 模式, 监听 {listen_addr})")
+            print(f"[START] 启动 zenohd (trace 模式, 监听 {listen_desc})")
             print(f"[START] RUST_LOG=debug 将打印详细报文日志")
             print(f"[START] 按 Ctrl+C 停止...\n")
             try:
@@ -152,7 +157,7 @@ class ZenohdManager:
             return True
         else:
             # 后台运行
-            print(f"[START] 启动 zenohd (后台, 监听 {listen_addr}) ...")
+            print(f"[START] 启动 zenohd (后台, 监听 {listen_desc}) ...")
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -167,7 +172,7 @@ class ZenohdManager:
                     with open(PID_FILE, "w") as f:
                         f.write(str(proc.pid))
                     print(f"[START] zenohd 已启动 (PID: {proc.pid})")
-                    print(f"[START] 监听 tcp/127.0.0.1:{int_port}")
+                    print(f"[START] 监听 {listen_desc}")
                     print(f"[START] 使用 'python host_zenoh_test.py stop' 停止")
                     return True
                 else:
@@ -343,7 +348,7 @@ class ProxyServer:
     def run(self):
         """启动代理服务器"""
         # 启动 zenohd（如果未运行）
-        ZenohdManager.start(int_port=self.int_port)
+        ZenohdManager.start(int_port=self.int_port, protocols=("tcp",))
 
         ext_addr = f"0.0.0.0:{self.ext_port}"
         int_addr = f"127.0.0.1:{self.int_port}"
@@ -502,6 +507,9 @@ def main():
     parser.add_argument("--router", type=str, default=None,
                         help="sub/pub/get 命令: 显式指定 router 端点，"
                              "如 tcp/127.0.0.1:7447 (默认使用 scouting)")
+    parser.add_argument("--proto", type=str, default="tcp",
+                        choices=["tcp", "udp", "tcp+udp"],
+                        help="start 命令: zenohd 监听协议 (默认 tcp)")
 
     args = parser.parse_args()
 
@@ -512,7 +520,8 @@ def main():
     cmd = args.cmd.lower()
 
     if cmd == "start":
-        ZenohdManager.start(trace=args.trace)
+        protocols = tuple(args.proto.split("+"))
+        ZenohdManager.start(trace=args.trace, protocols=protocols)
     elif cmd == "stop":
         ZenohdManager.stop()
     elif cmd == "status":

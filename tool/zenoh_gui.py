@@ -66,15 +66,22 @@ class ZenohdManager:
         return False
 
     @staticmethod
-    def start(port):
-        """后台启动 zenohd，返回 (ok, message)"""
+    def start(port, protocols=("tcp",)):
+        """后台启动 zenohd，返回 (ok, message)
+        protocols: 协议列表，如 ("tcp",) / ("udp",) / ("tcp", "udp")
+        """
         if ZenohdManager.is_running():
             return True, f"zenohd 已在运行 (PID: {ZenohdManager._find_pid()})"
         if not os.path.exists(ZENOHD_EXE):
             return False, f"未找到 zenohd: {ZENOHD_EXE}"
         try:
+            # 构建监听参数：每个协议一个 -l 参数
+            listen_args = []
+            for proto in protocols:
+                listen_args += ["-l", f"{proto}/0.0.0.0:{port}"]
+
             proc = subprocess.Popen(
-                [ZENOHD_EXE, "-l", f"tcp/0.0.0.0:{port}"],
+                [ZENOHD_EXE] + listen_args,
                 cwd=ZENOHD_DIR,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -84,7 +91,8 @@ class ZenohdManager:
             if ZenohdManager._check_process(proc.pid):
                 with open(PID_FILE, "w") as f:
                     f.write(str(proc.pid))
-                return True, f"zenohd 已启动 (PID: {proc.pid}, 端口 {port})"
+                proto_str = "+".join(protocols)
+                return True, f"zenohd 已启动 (PID: {proc.pid}, {proto_str}/0.0.0.0:{port})"
             return False, "zenohd 启动失败"
         except Exception as e:
             return False, f"启动异常: {e}"
@@ -182,16 +190,27 @@ class ZenohGUI(ctk.CTk):
         router_frame.grid(row=3, column=0, sticky="ew", padx=16)
         router_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(router_frame, text="端口:").grid(row=0, column=0, sticky="w")
-        self.port_entry = ctk.CTkEntry(router_frame, width=80, placeholder_text="7447")
-        self.port_entry.grid(row=0, column=1, sticky="w", padx=6)
+        # 第一行: 协议 + 端口 + 状态
+        ctk.CTkLabel(router_frame, text="协议:", anchor="w").grid(row=0, column=0, sticky="w")
+        self.protocol_var = ctk.StringVar(value="tcp")
+        proto_menu = ctk.CTkOptionMenu(
+            router_frame, variable=self.protocol_var,
+            values=["tcp", "udp", "tcp+udp"],
+            width=100,
+        )
+        proto_menu.grid(row=0, column=1, sticky="w", padx=6)
+
+        ctk.CTkLabel(router_frame, text="端口:", anchor="w").grid(row=0, column=2, sticky="w", padx=6)
+        self.port_entry = ctk.CTkEntry(router_frame, width=70, placeholder_text="7447")
+        self.port_entry.grid(row=0, column=3, sticky="w", padx=3)
         self.port_entry.insert(0, "7447")
 
         self.router_status = ctk.CTkLabel(router_frame, text="● 未知", text_color="orange")
-        self.router_status.grid(row=0, column=2, sticky="e", padx=6)
+        self.router_status.grid(row=0, column=4, sticky="e", padx=6)
 
+        # 第二行: 按钮
         btns = ctk.CTkFrame(router_frame, fg_color="transparent")
-        btns.grid(row=1, column=0, columnspan=3, pady=(8, 2), sticky="ew")
+        btns.grid(row=1, column=0, columnspan=5, pady=(8, 2), sticky="ew")
         btns.grid_columnconfigure((0, 1, 2), weight=1)
 
         ctk.CTkButton(btns, text="▶ 启动", command=self.on_start,
@@ -387,7 +406,10 @@ class ZenohGUI(ctk.CTk):
 
     def _start_worker(self):
         port = self.port_entry.get().strip() or "7447"
-        ok, msg = ZenohdManager.start(port)
+        proto_raw = self.protocol_var.get()
+        # "tcp" -> ("tcp",); "udp" -> ("udp",); "tcp+udp" -> ("tcp", "udp")
+        protocols = tuple(proto_raw.split("+"))
+        ok, msg = ZenohdManager.start(port, protocols=protocols)
         self.after(0, lambda: self._handle_router_result(ok, msg))
 
     def _handle_router_result(self, ok, msg):
@@ -492,7 +514,9 @@ class ZenohGUI(ctk.CTk):
         # 1. 确保 zenohd 运行
         if not ZenohdManager.is_running():
             port = self.port_entry.get().strip() or "7447"
-            ok, msg = ZenohdManager.start(port)
+            proto_raw = self.protocol_var.get()
+            protocols = tuple(proto_raw.split("+"))
+            ok, msg = ZenohdManager.start(port, protocols=protocols)
             if not ok:
                 self.after(0, lambda: self.log_error(f"路由器启动失败: {msg}"))
                 return
@@ -538,7 +562,9 @@ class ZenohGUI(ctk.CTk):
         # 确保 zenohd 运行
         if not ZenohdManager.is_running():
             port = self.port_entry.get().strip() or "7447"
-            ok, msg = ZenohdManager.start(port)
+            proto_raw = self.protocol_var.get()
+            protocols = tuple(proto_raw.split("+"))
+            ok, msg = ZenohdManager.start(port, protocols=protocols)
             if not ok:
                 messagebox.showerror("错误", f"无法启动 zenohd: {msg}")
                 return
