@@ -19,7 +19,7 @@ Thumbs.db
 .vscode/
 
 # Zenohd binaries (download from eclipse.org/zenoh)
-tool/zenoh/
+# tool/zenoh/
 
 # zenoh-pico cmake build artifacts
 CMakeCache.txt
